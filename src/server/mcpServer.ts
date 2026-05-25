@@ -137,6 +137,14 @@ export function createXppMcpServer(context: XppServerContext): Server {
       process.stderr.write(`[mcpServer] ℹ️  HTTP mode — skipping roots/list (transport is request-response only)\n`);
       return;
     }
+    // Instanced mode: .mcp.json / env vars already provide both model name and
+    // workspace path — the workspace is fully known and immutable per instance.
+    // Skipping the call avoids a -32001 timeout when mcp-remote is the transport
+    // (hard-coded 60 s timeout, server-initiated requests cannot complete over HTTP).
+    if (await getConfigManager().isStaticallyConfigured()) {
+      process.stderr.write(`[mcpServer] ℹ️  Static config complete — skipping roots/list (instanced mode)\n`);
+      return;
+    }
     try {
       const result = await server.request(
         { method: 'roots/list', params: {} },
@@ -157,6 +165,12 @@ export function createXppMcpServer(context: XppServerContext): Server {
     );
     const isHttpMode = !!process.env.WEBSITES_PORT || process.env.MCP_FORCE_HTTP === 'true';
     if (!server.getClientCapabilities()?.roots || isHttpMode) {
+      return;
+    }
+    // Instanced mode: workspace is immutable per server instance — the
+    // notification is irrelevant and the request would time out over mcp-remote.
+    if (await getConfigManager().isStaticallyConfigured()) {
+      process.stderr.write(`[mcpServer] ℹ️  Static config complete — skipping roots/list on change (instanced mode)\n`);
       return;
     }
     try {

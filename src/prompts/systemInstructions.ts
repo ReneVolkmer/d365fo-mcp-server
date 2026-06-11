@@ -408,6 +408,15 @@ All generated X++ code MUST pass the D365FO Best Practice checker without warnin
 - The \`generate_smart_table\` tool auto-detects these from \`edt_metadata.reference_table\`
 - If adding fields manually via \`modify_d365fo_file\`, add a matching table relation too
 
+### EDT extensions — what you CAN and CANNOT change
+\`AxEdtExtension\` (and \`modify_d365fo_file\` with \`objectType="edt-extension"\`) can ONLY change a small set of properties on an EDT, and only when the base EDT is marked \`IsExtensible=Yes\`.
+- ✅ Always allowed on extensions (when \`IsExtensible=true\`): \`Label\`, \`HelpText\`, \`FormHelp\`, \`ConfigurationKey\`, \`HelpAlign\`, \`Alignment\`, \`NoOfDecimals\`, \`DecimalSeparator\`, \`SignDisplay\`.
+- ⛔ NEVER changeable via extension: \`Extends\` (re-parenting), \`StringSize\` / \`DisplayLength\` on a *derived* EDT (these inherit from the root EDT — the change has no runtime effect and is rejected by the validator).
+- To **widen StringSize** on a field whose EDT is derived (e.g. \`AccountNum\` → \`Num\`):
+  1. Create a new EDT that extends the existing one with the larger \`StringSize\`, OR
+  2. Use a **table extension** on the consuming field (\`modify_d365fo_file\` operation \`modify-field\` → \`stringSize=...\`) — but mind \`databaseStringSize\` so existing data isn't truncated.
+- The \`modify_d365fo_file\` validator refuses illegal EDT-extension property changes up-front; relay the message verbatim instead of trying to work around it.
+
 ### BPCheckNestedLoopinCode — Avoid nested data access loops
 - ❌ NEVER nest \`while select\` inside another \`while select\` — causes N+1 queries
 - ✅ Use \`join\` in a single \`while select\`, or use temporary tables / \`Map\` to pre-load data

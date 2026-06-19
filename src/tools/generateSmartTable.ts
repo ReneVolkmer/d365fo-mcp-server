@@ -266,8 +266,11 @@ export async function handleGenerateSmartTable(
     }
   }
 
-  // Strategy 2: Generate common fields based on table group patterns
-  if (generateCommonFields && !copyFrom) {
+  // Strategy 2: Generate common fields based on table group patterns.
+  // Skip when the caller provided explicit fieldsHint — they have stated exactly
+  // which fields the table needs, so mining "commonly co-occurring" fields only
+  // injects unrelated infrastructure (e.g. MCRHoldCode) they then have to remove.
+  if (generateCommonFields && !copyFrom && !fieldsHint) {
     console.log(`[generateSmartTable] Analyzing patterns for table group: ${tableGroup}`);
     try {
       const db = symbolIndex.getReadDb();
@@ -308,10 +311,12 @@ export async function handleGenerateSmartTable(
           }
         }
 
-        // Add fields appearing in 30%+ of sample tables
+        // Add fields appearing in 30%+ of sample tables, excluding cross-cutting
+        // infrastructure fields that pollute most standard tables but rarely belong
+        // on a fresh custom table (the user did not ask for them).
         const threshold = Math.max(1, Math.floor(sampleTables.length * 0.3));
         const commonFields = Array.from(fieldFrequency.entries())
-          .filter(([, data]) => data.count >= threshold)
+          .filter(([key, data]) => data.count >= threshold && !isInfrastructureField(key.split(':')[0]))
           .sort((a, b) => b[1].count - a[1].count)
           .slice(0, 10);
 
@@ -334,15 +339,16 @@ export async function handleGenerateSmartTable(
   if (fieldsHint && !copyFrom) {
     console.log(`[generateSmartTable] Parsing field hints: ${fieldsHint}`);
     const hintFields = fieldsHint.split(',').map(s => s.trim()).filter(s => s.length > 0);
-    
+    const hintDb = symbolIndex.getReadDb();
+
     for (const hint of hintFields) {
       // Check if field already exists
       if (fields.find(f => f.name === hint)) {
         continue;
       }
 
-      // Try to suggest EDT based on name
-      const edt = suggestEdtFromFieldName(hint);
+      // Prefer a real EDT from the indexed environment over a generic name guess.
+      const edt = resolveBestEdt(hint, hintDb);
       const hintLower = hint.toLowerCase();
       // Mark as mandatory only when the field name IS an identifier (ends with 'Id',
       // equals 'RecId', or exactly 'AccountNum'/'CustAccount' patterns).
@@ -1040,7 +1046,74 @@ function validateEdtExists(edtName: string, db: any): boolean {
 /**
  * Suggest EDT based on field name heuristics
  */
-function suggestEdtFromFieldName(fieldName: string): string {
+/**
+ * Cross-cutting infrastructure fields that appear on a large share of standard
+ * tables (module framework hooks, audit columns, etc.) but should never be
+ * auto-injected onto a fresh custom table from frequency mining.
+ */
+export function isInfrastructureField(fieldName: string): boolean {
+  const INFRA = new Set([
+    'mcrholdcode', 'mcrholduserid', 'mcrholddatetime',
+    'sortorder', 'displayorder',
+    'createdby', 'createddatetime', 'modifiedby', 'modifieddatetime',
+    'createdtransactionid', 'modifiedtransactionid',
+    'recid', 'recversion', 'dataareaid', 'partition', 'tableid', 'instancerelationtype',
+  ]);
+  return INFRA.has(fieldName.toLowerCase());
+}
+
+/**
+ * Confidence that an EDT name corresponds to a field name, by containment.
+ * 1.0 = identical; high when one fully contains the other (e.g. field
+ * "RentEquipmentId" ⊂ EDT "AslRentEquipmentId" — a model-prefixed custom EDT).
+ */
+function edtNameConfidence(field: string, edt: string): number {
+  const f = field.toLowerCase();
+  const e = edt.toLowerCase();
+  if (f === e) return 1.0;
+  if (e.includes(f)) return 0.9 - (e.length - f.length) * 0.01;
+  if (f.includes(e)) return 0.8 - (f.length - e.length) * 0.01;
+  return 0;
+}
+
+/**
+ * Resolve the best EDT for a field name, preferring REAL EDTs from the indexed
+ * environment over generic name heuristics. This is what makes the scaffold pick
+ * a project's own EDT (e.g. AslRentEquipmentId) instead of a generic guess
+ * (RefRecId) that is the wrong base type.
+ *
+ * Order: exact EDT-name match → strong fuzzy match (≥0.8) → name heuristic that
+ * actually exists in this environment → weaker fuzzy match (≥0.6) → raw heuristic.
+ */
+export function resolveBestEdt(fieldName: string, db: any): string {
+  try {
+    const exact = db.prepare(
+      `SELECT edt_name FROM edt_metadata WHERE edt_name = ? COLLATE NOCASE LIMIT 1`
+    ).get(fieldName) as { edt_name: string } | undefined;
+    if (exact) return exact.edt_name;
+
+    const candidates = db.prepare(
+      `SELECT edt_name FROM edt_metadata WHERE edt_name LIKE ? COLLATE NOCASE ORDER BY LENGTH(edt_name) ASC LIMIT 30`
+    ).all(`%${fieldName}%`) as Array<{ edt_name: string }>;
+    let best = '';
+    let bestConf = 0;
+    for (const c of candidates) {
+      const conf = edtNameConfidence(fieldName, c.edt_name);
+      if (conf > bestConf) { bestConf = conf; best = c.edt_name; }
+    }
+    if (best && bestConf >= 0.8) return best;
+
+    const heuristic = suggestEdtFromFieldName(fieldName);
+    if (validateEdtExists(heuristic, db)) return heuristic;
+
+    if (best && bestConf >= 0.6) return best;
+  } catch {
+    /* DB unavailable — fall back to the pure heuristic below */
+  }
+  return suggestEdtFromFieldName(fieldName);
+}
+
+export function suggestEdtFromFieldName(fieldName: string): string {
   const nameLower = fieldName.toLowerCase();
 
   // Common patterns
@@ -1053,23 +1126,28 @@ function suggestEdtFromFieldName(fieldName: string): string {
   if (nameLower === 'description') return 'Description';
   if (nameLower.includes('description') || nameLower === 'desc') return 'Description';
   if (nameLower.includes('amount')) return 'AmountMST';
+  if (nameLower.includes('rate')) return 'AmountMST';
   if (nameLower.includes('quantity') || nameLower.includes('qty')) return 'Qty';
   if (nameLower.includes('price')) return 'PriceUnit';
-  // ValidFrom / ValidTo — D365FO date effectivity pattern
-  if (nameLower === 'validfrom' || nameLower === 'fromdate' || nameLower === 'datefrom' || nameLower === 'platnostod') return 'ValidFromDateTime';
-  if (nameLower === 'validto' || nameLower === 'todate' || nameLower === 'dateto' || nameLower === 'platnostdo') return 'ValidToDateTime';
-  if (nameLower.includes('validfrom') || nameLower.includes('fromdate')) return 'ValidFromDateTime';
-  if (nameLower.includes('validto') || nameLower.includes('todate')) return 'ValidToDateTime';
+  // ValidFrom / ValidTo — D365FO datetime effectivity pattern (UtcDateTime EDTs).
+  // Only the bare effectivity names map to the *DateTime EDTs; any other field
+  // whose name ends in "date" is a calendar Date → TransDate.
+  if (nameLower === 'validfrom') return 'ValidFromDateTime';
+  if (nameLower === 'validto') return 'ValidToDateTime';
+  if (nameLower.includes('datetime') || nameLower.includes('time')) return 'TransDateTime';
   if (nameLower.includes('date')) return 'TransDate';
-  if (nameLower.includes('time') || nameLower.includes('datetime')) return 'TransDateTime';
   if (nameLower.includes('account')) return 'LedgerAccount';
   if (nameLower.includes('customer') || nameLower.includes('cust')) return 'CustAccount';
   if (nameLower.includes('vendor') || nameLower.includes('vend')) return 'VendAccount';
   if (nameLower.includes('item')) return 'ItemId';
   if (nameLower.includes('percent') || nameLower.includes('pct')) return 'Percent';
-  if (nameLower.includes('status')) return 'NoYesId';
   if (nameLower.includes('enabled') || nameLower.includes('active') || nameLower.includes('flag')) return 'NoYesId';
-  if (nameLower.includes('id') && !nameLower.includes('recid')) return 'RefRecId';
+
+  // NOTE: deliberately NO blanket "*id → RefRecId" or "status → NoYesId" rule.
+  // RefRecId (int64) is the wrong base type for the common string business key
+  // (e.g. RentEquipmentId), and "status" is usually a domain enum, not a boolean.
+  // Such fields fall through to a string default unless a real EDT matches via
+  // resolveBestEdt — far less wrong than forcing the field to the wrong type.
 
   // Default to string
   return 'String255';

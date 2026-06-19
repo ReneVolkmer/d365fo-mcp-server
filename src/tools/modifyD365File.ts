@@ -197,6 +197,9 @@ const ModifyD365FileArgsSchema = z.object({
     'Operation to perform. ' +
     'replace-code REQUIRES parameters: oldCode (exact code to find) + newCode (replacement). ' +
     'add-method REQUIRES: methodName + sourceCode. ' +
+    'add-table-method: pass tableMethodType (find/exist/findByRecId/validateWrite/validateDelete/initValue) ' +
+    '(+ tableKeyField for find/exist) to auto-generate the method, OR methodName + sourceCode for a custom one. ' +
+    'add-display-method: pass methodName + displayMethodReturnEdt to auto-generate a stub, OR methodName + sourceCode. ' +
     'For form control override methods with replace-code, use methodName="ControlName.methodName" (e.g. "PostButton.clicked").'
   ),
 
@@ -482,6 +485,8 @@ export async function modifyD365FileTool(request: CallToolRequest, context: XppS
     // up the base form XML, walk the control tree, and resolve to the exact name.
     // This makes add-control seamless — no prior get_object_info(form) call required.
     let addControlNote = '';
+    // Note surfaced when add-table-method / add-display-method generates the source.
+    let generationNote = '';
     if (operation === 'add-control' && objectType === 'form-extension' && args.parentControl) {
       const resolution = await resolveParentControl(
         objectName,
@@ -666,16 +671,73 @@ export async function modifyD365FileTool(request: CallToolRequest, context: XppS
     let bridgeResult: { success: boolean; message: string } | null = null;
 
     switch (operation) {
-      case 'add-method':
-      case 'add-display-method':
-      case 'add-table-method': {
-        if (args.methodName && args.sourceCode) {
+      case 'add-method': {
+        // sourceCode and methodCode are documented aliases; sourceCode wins when both
+        // are supplied. Accept either so callers passing the methodCode alias are not
+        // silently dropped into the "returned null" path.
+        const methodSource = args.sourceCode ?? (args as any).methodCode;
+        if (args.methodName && methodSource) {
           bridgeResult = await bridgeAddMethod(
             context.bridge,
             objectType,
             objectName,
             args.methodName,
-            args.sourceCode,
+            methodSource,
+          );
+        }
+        break;
+      }
+      case 'add-display-method': {
+        // Accept explicit source (sourceCode/methodCode alias) verbatim; otherwise
+        // generate a display-method stub from displayMethodReturnEdt + methodName.
+        let methodSource = args.sourceCode ?? (args as any).methodCode;
+        const methodName = args.methodName;
+        if (!methodSource && methodName && (args as any).displayMethodReturnEdt) {
+          methodSource = generateDisplayMethodSource(
+            methodName,
+            (args as any).displayMethodReturnEdt,
+          );
+          generationNote =
+            `\n\n> 🔧 Display method \`${methodName}\` generated returning ` +
+            `\`${(args as any).displayMethodReturnEdt}\` (stub — fill in the computation).`;
+        }
+        if (methodName && methodSource) {
+          bridgeResult = await bridgeAddMethod(
+            context.bridge,
+            objectType,
+            objectName,
+            methodName,
+            methodSource,
+          );
+        }
+        break;
+      }
+      case 'add-table-method': {
+        // Accept explicit source (sourceCode/methodCode alias) verbatim; otherwise
+        // generate a standard table method from tableMethodType (+ tableKeyField).
+        let methodSource = args.sourceCode ?? (args as any).methodCode;
+        let methodName = args.methodName;
+        if (!methodSource && (args as any).tableMethodType) {
+          const gen = generateTableMethodSource(
+            objectName,
+            (args as any).tableMethodType,
+            (args as any).tableKeyField,
+            symbolIndex.getReadDb(),
+          );
+          methodName = gen.methodName;
+          methodSource = gen.source;
+          generationNote =
+            `\n\n> 🔧 Table method \`${gen.methodName}\` generated from ` +
+            `tableMethodType="${(args as any).tableMethodType}".` +
+            (gen.note ? `\n> ${gen.note}` : '');
+        }
+        if (methodName && methodSource) {
+          bridgeResult = await bridgeAddMethod(
+            context.bridge,
+            objectType,
+            objectName,
+            methodName,
+            methodSource,
           );
         }
         break;
@@ -776,8 +838,8 @@ export async function modifyD365FileTool(request: CallToolRequest, context: XppS
             objectName,
             (args as any).indexName,
             (args as any).indexFields,
-            (args as any).allowDuplicates,
-            (args as any).alternateKey,
+            (args as any).indexAllowDuplicates,
+            (args as any).indexAlternateKey,
           );
         }
         break;
@@ -1031,12 +1093,16 @@ export async function modifyD365FileTool(request: CallToolRequest, context: XppS
     if (!bridgeResult) {
       const paramHints: Record<string, string[]> = {
         'add-method': ['methodName', 'sourceCode'],
+        'add-display-method': ['methodName', 'sourceCode'],
+        'add-table-method': ['methodName', 'sourceCode'],
         'remove-method': ['methodName'],
         'replace-code': ['oldCode', 'newCode'],
         'add-field': ['fieldName', 'fieldType'],
         'modify-field': ['fieldName'],
         'rename-field': ['fieldName', 'fieldNewName'],
-        'add-index': ['indexName'],
+        'remove-field': ['fieldName'],
+        'replace-all-fields': ['fields'],
+        'add-index': ['indexName', 'indexFields'],
         'remove-index': ['indexName'],
         'add-relation': ['relationName', 'relatedTable'],
         'remove-relation': ['relationName'],
@@ -1045,11 +1111,23 @@ export async function modifyD365FileTool(request: CallToolRequest, context: XppS
         'add-field-to-field-group': ['fieldGroupName', 'fieldName'],
         'add-control': ['controlName', 'parentControl'],
         'add-data-source': ['dataSourceName', 'dataSourceTable'],
+        'add-field-modification': ['fieldName'],
+        'add-enum-value': ['enumValueName'],
+        'modify-enum-value': ['enumValueName'],
+        'remove-enum-value': ['enumValueName'],
+        'add-menu-item-to-menu': ['menuItemToAdd'],
         'modify-property': ['propertyPath', 'propertyValue'],
       };
       const required = paramHints[operation] ?? [];
-      const missingList = required.filter(p => !(args as any)[p]).map(p => `  ⛔ ${p}: MISSING`);
-      const providedList = required.filter(p => (args as any)[p]).map(p => `  ✅ ${p}: provided`);
+      // Some params have documented aliases — treat any alias as satisfying the requirement
+      // so the diagnostic doesn't report a param "MISSING" when its alias was supplied.
+      const aliases: Record<string, string[]> = {
+        sourceCode: ['methodCode'],
+      };
+      const isProvided = (p: string) =>
+        (args as any)[p] !== undefined || (aliases[p] ?? []).some(a => (args as any)[a] !== undefined);
+      const missingList = required.filter(p => !isProvided(p)).map(p => `  ⛔ ${p}: MISSING`);
+      const providedList = required.filter(p => isProvided(p)).map(p => `  ✅ ${p}: provided`);
       throw new Error(
         `Bridge operation '${operation}' returned null — required parameters may be missing.\n` +
         `Required parameters for '${operation}':\n${[...providedList, ...missingList].join('\n')}\n` +
@@ -1125,7 +1203,7 @@ export async function modifyD365FileTool(request: CallToolRequest, context: XppS
           type: 'text',
           text:
             `✅ ${operation} on ${objectType} "${objectName}" — applied via IMetadataProvider.Update()\n\n` +
-            `**File:** ${actualFilePath}${addControlNote}${bridgeValidation}${projectMessage}\n` +
+            `**File:** ${actualFilePath}${addControlNote}${generationNote}${bridgeValidation}${projectMessage}\n` +
             `🔧 API: ${bridgeResult.message}\n\n` +
             `**Next steps:**\n- Review changes in Visual Studio\n- Build the model to validate`,
         },
@@ -1622,4 +1700,189 @@ function resolveEdtBaseTypeForField(edtName: string, db: any, depth = 0): string
   } catch {
     return edtName;
   }
+}
+
+/** Lower-case the first character — D365FO convention for a table buffer variable. */
+function bufferVarName(tableName: string): string {
+  return tableName.charAt(0).toLowerCase() + tableName.slice(1);
+}
+
+/**
+ * Resolve the EDT/type of a table field from the symbol index so generated
+ * find/exist signatures use the correct parameter type. The field's `signature`
+ * column stores its EDT name. Returns null when the field is not indexed.
+ */
+function resolveFieldEdt(tableName: string, fieldName: string, db: any): string | null {
+  try {
+    const row = db.prepare(
+      `SELECT signature FROM symbols WHERE type = 'field' AND parent_name = ? COLLATE NOCASE AND name = ? COLLATE NOCASE LIMIT 1`
+    ).get(tableName, fieldName) as { signature: string | null } | undefined;
+    const sig = row?.signature?.trim();
+    return sig ? sig : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Generate idiomatic X++ source for a standard table method from a high-level
+ * `tableMethodType`. The method name is implied by the type (find/exist/…), so
+ * callers need not pass methodName or sourceCode — only tableMethodType (plus
+ * tableKeyField for find/exist).
+ *
+ * Returns the generated method name, source, and an optional advisory note
+ * (e.g. when the key field's EDT could not be resolved from the index).
+ */
+export function generateTableMethodSource(
+  tableName: string,
+  methodType: 'find' | 'exist' | 'findByRecId' | 'validateWrite' | 'validateDelete' | 'initValue',
+  keyField: string | undefined,
+  db: any,
+): { methodName: string; source: string; note?: string } {
+  const buf = bufferVarName(tableName);
+
+  switch (methodType) {
+    case 'find':
+    case 'exist': {
+      if (!keyField) {
+        throw new Error(
+          `add-table-method with tableMethodType="${methodType}" requires tableKeyField ` +
+          `(the primary key field to select on, e.g. tableKeyField="ItemId").`
+        );
+      }
+      const resolvedEdt = resolveFieldEdt(tableName, keyField, db);
+      const paramType = resolvedEdt ?? keyField;
+      const note = resolvedEdt
+        ? undefined
+        : `⚠️ Could not resolve the EDT for field "${keyField}" on "${tableName}" from the index — ` +
+          `the parameter type defaulted to "${keyField}". Verify it compiles, or pass full sourceCode instead.`;
+      const param = `_${bufferVarName(keyField)}`;
+
+      if (methodType === 'find') {
+        const source =
+          `/// <summary>\n` +
+          `/// Finds the <c>${tableName}</c> record for the given ${keyField}.\n` +
+          `/// </summary>\n` +
+          `/// <param name = "${param}">The ${keyField} value to find.</param>\n` +
+          `/// <param name = "_forUpdate">Select the record for update; optional.</param>\n` +
+          `/// <returns>The matching <c>${tableName}</c> record; an empty buffer if none exists.</returns>\n` +
+          `public static ${tableName} find(${paramType} ${param}, boolean _forUpdate = false)\n` +
+          `{\n` +
+          `    ${tableName} ${buf};\n` +
+          `\n` +
+          `    if (${param})\n` +
+          `    {\n` +
+          `        ${buf}.selectForUpdate(_forUpdate);\n` +
+          `\n` +
+          `        select firstonly ${buf}\n` +
+          `            where ${buf}.${keyField} == ${param};\n` +
+          `    }\n` +
+          `\n` +
+          `    return ${buf};\n` +
+          `}`;
+        return { methodName: 'find', source, note };
+      }
+
+      // exist
+      const source =
+        `/// <summary>\n` +
+        `/// Checks whether a <c>${tableName}</c> record exists for the given ${keyField}.\n` +
+        `/// </summary>\n` +
+        `/// <param name = "${param}">The ${keyField} value to check.</param>\n` +
+        `/// <returns>true if a matching record exists; otherwise false.</returns>\n` +
+        `public static boolean exist(${paramType} ${param})\n` +
+        `{\n` +
+        `    return ${param} &&\n` +
+        `        (select firstonly RecId from ${buf}\n` +
+        `            where ${buf}.${keyField} == ${param}).RecId != 0;\n` +
+        `}`;
+      return { methodName: 'exist', source, note };
+    }
+
+    case 'findByRecId': {
+      const source =
+        `/// <summary>\n` +
+        `/// Finds the <c>${tableName}</c> record for the given RecId.\n` +
+        `/// </summary>\n` +
+        `/// <param name = "_recId">The RecId to find.</param>\n` +
+        `/// <param name = "_forUpdate">Select the record for update; optional.</param>\n` +
+        `/// <returns>The matching <c>${tableName}</c> record; an empty buffer if none exists.</returns>\n` +
+        `public static ${tableName} findByRecId(RefRecId _recId, boolean _forUpdate = false)\n` +
+        `{\n` +
+        `    ${tableName} ${buf};\n` +
+        `\n` +
+        `    if (_recId)\n` +
+        `    {\n` +
+        `        ${buf}.selectForUpdate(_forUpdate);\n` +
+        `\n` +
+        `        select firstonly ${buf}\n` +
+        `            where ${buf}.RecId == _recId;\n` +
+        `    }\n` +
+        `\n` +
+        `    return ${buf};\n` +
+        `}`;
+      return { methodName: 'findByRecId', source };
+    }
+
+    case 'validateWrite':
+    case 'validateDelete': {
+      const source =
+        `/// <summary>\n` +
+        `/// Validates the record before ${methodType === 'validateWrite' ? 'writing' : 'deletion'}.\n` +
+        `/// </summary>\n` +
+        `/// <returns>true if the record is valid; otherwise false.</returns>\n` +
+        `public boolean ${methodType}()\n` +
+        `{\n` +
+        `    boolean ret;\n` +
+        `\n` +
+        `    ret = super();\n` +
+        `\n` +
+        `    // TODO: add custom ${methodType} validation\n` +
+        `\n` +
+        `    return ret;\n` +
+        `}`;
+      return { methodName: methodType, source };
+    }
+
+    case 'initValue': {
+      const source =
+        `/// <summary>\n` +
+        `/// Initializes the record with default field values.\n` +
+        `/// </summary>\n` +
+        `public void initValue()\n` +
+        `{\n` +
+        `    super();\n` +
+        `\n` +
+        `    // TODO: set default field values\n` +
+        `}`;
+      return { methodName: 'initValue', source };
+    }
+
+    default: {
+      // Exhaustiveness guard — the schema enum should keep this unreachable.
+      throw new Error(`Unsupported tableMethodType: ${methodType as string}`);
+    }
+  }
+}
+
+/**
+ * Generate an X++ display method stub returning the given EDT/type.
+ * Used when add-display-method is called with displayMethodReturnEdt but no
+ * explicit sourceCode/methodCode.
+ */
+export function generateDisplayMethodSource(methodName: string, returnEdt: string): string {
+  return (
+    `/// <summary>\n` +
+    `/// Display method returning <c>${returnEdt}</c>.\n` +
+    `/// </summary>\n` +
+    `/// <returns>The computed ${returnEdt} value.</returns>\n` +
+    `public display ${returnEdt} ${methodName}()\n` +
+    `{\n` +
+    `    ${returnEdt} ret;\n` +
+    `\n` +
+    `    // TODO: compute the display value\n` +
+    `\n` +
+    `    return ret;\n` +
+    `}`
+  );
 }

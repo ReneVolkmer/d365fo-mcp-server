@@ -101,9 +101,9 @@ describe('resolveBestEdt (DB-aware)', () => {
     // The edtWarnings system in the caller validates it separately.
     const db = fakeDb([]); // empty index — custom EDT not indexed yet
     expect(resolveBestEdt('ContosoRentEquipmentId', db)).toBe('ContosoRentEquipmentId');
-    expect(resolveBestEdt('AslRentAgreementId', db)).toBe('AslRentAgreementId');
-    // Note: AslRentDailyRate still maps to AmountMST via the 'rate' heuristic — correct behavior.
-    expect(resolveBestEdt('AslRentDailyRate', db)).toBe('AmountMST');
+    expect(resolveBestEdt('ContosoRentAgreementId', db)).toBe('ContosoRentAgreementId');
+    // Note: ContosoRentDailyRate still maps to AmountMST via the 'rate' heuristic — correct behavior.
+    expect(resolveBestEdt('ContosoRentDailyRate', db)).toBe('AmountMST');
   });
 
   it('does NOT return the fieldName for generic single-word fields even if PascalCase', () => {
